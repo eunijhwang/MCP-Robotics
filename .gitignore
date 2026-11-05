@@ -4,7 +4,6 @@ __pycache__/
 .DS_Store
 .venv/
 # Local execution records are kept on disk, not source-controlled.
-logs/
 ollama_diagnostic.json
 received_intent.json
 received_policy.yaml

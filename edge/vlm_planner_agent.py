@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""qwen2.5vl JSON tool-selection loop. No hidden rule-based driving fallback."""
+"""qwen3-vl:4b-instruct JSON tool-selection loop. No hidden rule-based driving fallback."""
 
 import json
 import copy
@@ -15,6 +15,7 @@ from common.navigation_utils import goal_geometry
 from common.goal_completion import GOAL_TOLERANCE_M
 from common.speed_policy import select_speed
 from edge.prompt_context import compact_messages, context_tokens_needed
+from edge.planner_progress import PlannerProgress
 
 log = logging.getLogger(__name__)
 SYSTEM_PROMPT = """You control a ROS2 robot through tools. Choose the next useful action autonomously.
@@ -85,6 +86,12 @@ a farther collision reported by execute_path. Replan around that collision or ob
 The original-height LIMO has rear self-occlusion. Do not assume that blind region is empty.
 Use forward travel; reverse is disabled. Resetting a safety latch is not proof of rotation clearance.
 Rotation uses swept-footprint checks; static_map_only_simulation means rear dynamic clearance is unverified.
+For coordinate navigation, progress_policy is enforced: after collision, call plan_path before
+another execute_path. Before any observation rotation, try plan_path in this cycle; if a candidate
+exists, inspect and execute or revise it. Only after failed planning may you choose an observation
+rotation of 3.5..30 degrees, at most twice without 0.5m translational progress. Heading alignment
+belongs to execute_path. At most four successful observation queries per cycle, twice per identical
+query. Use their results to plan instead of repeatedly querying a clear nearby radius.
 """
 
 
@@ -193,6 +200,7 @@ class OllamaMCPPlannerAgent:
         self.request_diagnostics = []
         self.context_key = None
         self.planning_context = {}
+        self.progress_policy = PlannerProgress()
         self.audit_writer = AuditLog()
         self.audit_record = None
         self.audit_error = None
@@ -540,6 +548,7 @@ class OllamaMCPPlannerAgent:
         trace = []
         attempts = []
         speed_decisions = []
+        self.progress_policy.begin(world_state)
 
         def call(name, args):
             self.audit_event(
@@ -547,6 +556,7 @@ class OllamaMCPPlannerAgent:
                 {"tool": name, "arguments": args, "intent_version": version},
             )
             result = self.mcp.call_tool(name, args, expected_intent_version=version)
+            self.progress_policy.record(name, args, result)
             self.audit_event(
                 "tool_result", {"tool": name, "arguments": args, "result": result}
             )
@@ -607,6 +617,7 @@ class OllamaMCPPlannerAgent:
                 "mcp_tool_trace": trace,
                 "model_attempts": attempts,
                 "speed_decisions": copy.deepcopy(speed_decisions),
+                "progress_policy": self.progress_policy.snapshot(),
                 "request_diagnostics": self.request_diagnostics,
                 **extra,
             }
@@ -883,6 +894,37 @@ class OllamaMCPPlannerAgent:
                         )
                 if not isinstance(calls, list) or not 1 <= len(calls) <= 8:
                     raise ValueError("Tool call list must contain 1 to 8 calls")
+                # Accept only an unambiguous alias for a discovered tool. Preserve
+                # the original response in parsed_decision; never repair path values.
+                calls = copy.deepcopy(calls)
+                known_tools = {tool["name"] for tool in tools}
+                for tc in calls:
+                    if not isinstance(tc, dict):
+                        raise ValueError(
+                            "Each tool call must be a name/arguments object"
+                        )
+                    if "tool" in tc:
+                        alias = tc["tool"]
+                        if (
+                            not isinstance(alias, str)
+                            or alias not in known_tools
+                            or ("name" in tc and tc["name"] != alias)
+                        ):
+                            raise ValueError(
+                                "AMBIGUOUS_TOOL_NAME: use name with one available tool name"
+                            )
+                        tc["name"] = tc.pop("tool")
+                        self.audit_event(
+                            "tool_name_normalized",
+                            {"iteration": iteration + 1, "name": alias},
+                        )
+                names = [tc.get("name") for tc in calls]
+                if "plan_path" in names and any(
+                    n in names for n in ("execute_path", "rotate_robot")
+                ):
+                    raise ValueError(
+                        "DEPENDENT_TOOL_BATCH: request plan_path alone, inspect its result in a new model turn, then choose motion"
+                    )
                 for tool_index, tc in enumerate(calls):
                     if not isinstance(tc, dict):
                         raise ValueError(
@@ -891,6 +933,22 @@ class OllamaMCPPlannerAgent:
                     args = tc.get("arguments", {})
                     if isinstance(args, str):
                         args = json.loads(args)
+                    if not isinstance(args, dict):
+                        raise ValueError("Tool arguments must be an object")
+                    try:
+                        self.progress_policy.check(tc["name"], args)
+                    except ValueError as exc:
+                        self.audit_event(
+                            "progress_policy_rejected",
+                            {
+                                "iteration": iteration + 1,
+                                "tool": tc["name"],
+                                "arguments": args,
+                                "error": str(exc),
+                                "progress_policy": self.progress_policy.snapshot(),
+                            },
+                        )
+                        raise
                     speed_decision = None
                     speed_reason = parsed.get("speed_reason")
                     reason_location = "response.speed_reason"

@@ -86,8 +86,16 @@ a farther collision reported by execute_path. Replan around that collision or ob
 The original-height LIMO has rear self-occlusion. Do not assume that blind region is empty.
 Use forward travel; reverse is disabled. Resetting a safety latch is not proof of rotation clearance.
 Rotation uses swept-footprint checks; static_map_only_simulation means rear dynamic clearance is unverified.
-For coordinate navigation, progress_policy is enforced: after collision, call plan_path before
-another execute_path. Before any observation rotation, try plan_path in this cycle; if a candidate
+For each new coordinate move/detour/resume intent, first request plan_path alone using the target
+coordinates and safety margin. Inspect its successful path result in a new turn before execute_path.
+Use the returned route; do not begin with a direct goal waypoint just because nearby space is clear.
+PLAN_REQUIRED is an error code, not a decision: use decision=PLAN with a single plan_path call.
+An existing successful initial plan is retained across cycles of the same intent; fresh collision
+checks still apply to every execution. For coordinate navigation, after collision, call plan_path before
+another execute_path. REPLAN_REQUIRED is an error code, never a decision value. Use decision=REPLAN
+with exactly one plan_path call; inspect its result in a new turn before selecting execute_path.
+Each mcp_tool_calls entry must contain name and arguments, never a nested decision or call list.
+Before any observation rotation, try plan_path in this cycle; if a candidate
 exists, inspect and execute or revise it. Only after failed planning may you choose an observation
 rotation of 3.5..30 degrees, at most twice without 0.5m translational progress. Heading alignment
 belongs to execute_path. At most four successful observation queries per cycle, twice per identical
@@ -698,6 +706,18 @@ class OllamaMCPPlannerAgent:
                         world_state.get("robot_state", {}),
                         self.resolve_target_coordinates(world_state),
                     ),
+                    "progress_policy": self.progress_policy.snapshot(),
+                    "planning_order": (
+                        "Call plan_path alone now (decision=REPLAN), inspect its result, then choose motion."
+                        if self.progress_policy.enabled
+                        and self.progress_policy.replan_required
+                        else (
+                            "First call plan_path alone (decision=PLAN); inspect its returned path before execute_path."
+                            if self.progress_policy.enabled
+                            and not self.progress_policy.initial_plan_ready
+                            else "Use current evidence and validated route progress to choose the next tool."
+                        )
+                    ),
                     "recovery_context": {
                         "safety_latched": world_state.get("navigation", {}).get(
                             "e_stop", False
@@ -789,6 +809,39 @@ class OllamaMCPPlannerAgent:
                     },
                 )
                 attempt.update(decision=decision, outcome="parsed")
+                # Preserve the raw response above. Repair only an unambiguous
+                # planning label, never invent tools, arguments, or movement.
+                repair_calls = parsed.get("mcp_tool_calls")
+                if (
+                    not native_calls
+                    and decision in ("PLAN_REQUIRED", "REPLAN_REQUIRED")
+                    and "path" not in parsed
+                    and isinstance(repair_calls, list)
+                    and len(repair_calls) == 1
+                    and isinstance(repair_calls[0], dict)
+                    and set(repair_calls[0]) <= {"name", "tool", "arguments"}
+                    and repair_calls[0].get("name", repair_calls[0].get("tool"))
+                    == "plan_path"
+                    and repair_calls[0].get("tool", "plan_path") == "plan_path"
+                    and isinstance(repair_calls[0].get("arguments"), dict)
+                ):
+                    parsed = copy.deepcopy(parsed)
+                    original_decision = decision
+                    parsed["decision"] = decision = (
+                        "REPLAN" if decision == "REPLAN_REQUIRED" else "PLAN"
+                    )
+                    attempt.update(
+                        decision=decision, original_decision=original_decision
+                    )
+                    self.audit_event(
+                        "decision_normalized",
+                        {
+                            "iteration": iteration + 1,
+                            "original_decision": original_decision,
+                            "decision": decision,
+                            "reason": "Single explicit plan_path call",
+                        },
+                    )
                 # Keep executable choices as history, not repetitive natural-language reasoning.
                 # Full original responses remain available in model_attempts diagnostics.
                 if native_calls:
@@ -917,6 +970,15 @@ class OllamaMCPPlannerAgent:
                         self.audit_event(
                             "tool_name_normalized",
                             {"iteration": iteration + 1, "name": alias},
+                        )
+                    if (
+                        not isinstance(tc.get("name"), str)
+                        or tc["name"] not in known_tools
+                        or "decision" in tc
+                        or "mcp_tool_calls" in tc
+                    ):
+                        raise ValueError(
+                            "INVALID_TOOL_CALL: each entry requires an available name and arguments; nested decisions or call lists are not allowed"
                         )
                 names = [tc.get("name") for tc in calls]
                 if "plan_path" in names and any(
@@ -1099,10 +1161,45 @@ class OllamaMCPPlannerAgent:
                     exc,
                     attempt["response_excerpt"],
                 )
+                feedback = (
+                    f"Invalid decision: {exc}. Return a single JSON object. Allowed decision values: "
+                    "PLAN, REPLAN, ACT, OBSERVE, COMPLETE, FAIL. Error codes are not decision values. "
+                    "Each mcp_tool_calls entry must be a name/arguments object, without nested decisions."
+                )
+                if self.progress_policy.enabled and (
+                    self.progress_policy.replan_required
+                    or not self.progress_policy.initial_plan_ready
+                ):
+                    target = intent.get("target_location") or {}
+                    feedback += (
+                        " Planning is required before motion. Request plan_path alone, inspect its result in a new turn, then choose execution or FAIL. Response shape: "
+                        + prompt_json(
+                            {
+                                "decision": (
+                                    "REPLAN"
+                                    if self.progress_policy.replan_required
+                                    else "PLAN"
+                                ),
+                                "mcp_tool_calls": [
+                                    {
+                                        "name": "plan_path",
+                                        "arguments": {
+                                            "goal_x": target.get("x"),
+                                            "goal_y": target.get("y"),
+                                            "frame_id": target.get("frame_id", "map"),
+                                            "safety_margin_m": (
+                                                intent.get("constraints") or {}
+                                            ).get("safety_margin_m", 0.45),
+                                        },
+                                    }
+                                ],
+                            }
+                        )
+                    )
                 messages.append(
                     {
                         "role": "user",
-                        "content": f"Invalid decision: {exc}. Return a single JSON object with decision and the required fields. For observation use decision=OBSERVE and mcp_tool_calls=[{{name: an available tool name, arguments: an object}}]. Do not return the schema itself.",
+                        "content": feedback,
                     }
                 )
         call(

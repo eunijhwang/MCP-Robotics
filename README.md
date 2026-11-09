@@ -1,6 +1,6 @@
 # IETF-127 MCP-Robotics
 
-Last updated: **2026-11-05**
+Last updated: **2026-11-09**
 
 A navigation framework that accepts user intents and uses a **VLM to select tools and paths for controlling a ROS2 robot**.
 
@@ -12,9 +12,12 @@ A navigation framework that accepts user intents and uses a **VLM to select tool
 | **Edge** | YOLO–LiDAR fusion, VLM decision-making and replanning, MCP tools, and result reporting |
 | **Robot Car** | Receive ROS2 sensor data, control motion, perform safety checks, and stop the robot |
 
-- Prioritize the user-specified speed; let the VLM select a speed when none is provided
+- Convert natural-language coordinate commands into validated intents through `manager`
+- Prioritize the user-specified speed; otherwise let the Edge VLM select a speed and record its explanation
 - Validate and replan paths using map, LiDAR, and detected-object data
-- Save one JSON log and print the result to the terminal when a scenario ends
+- Call T6 tools through the official MCP client using Streamable HTTP `tools/call`
+- Compact repeated model history while retaining images, route candidates, and collision evidence
+- Save one scenario JSON log and print the result to the terminal when a scenario ends
 
 ## Runtime Environment
 
@@ -70,18 +73,38 @@ The `mcp` field in Edge's `/health` response reflects Edge's most recent communi
 
 ## Example Intent Requests
 
-**Navigate to a target location** (example coordinates for the warehouse scene)
+**Navigate using natural language** (run after T1–T6 are ready)
 
 ```bash
-curl -sS -X POST http://127.0.0.1:5000/receive_intent \
-  -H 'Content-Type: application/json' \
-  -d '{"intent_id":"move_001","action":"move","target_location":{"x":-16.0,"y":0.0,"frame_id":"map"},"constraints":{"safety_margin_m":0.45,"speed_mps":0.2},"report":true}'
+python3 -m manager.run "x:-16 y:0 좌표까지 이동 후 보고해줘" --send
 ```
 
-The allowed range for `speed_mps` is **0.01–0.35 m/s**.
-Use a new `intent_id` for each new navigation request.
+If no numeric speed is provided, `manager` omits `constraints.speed_mps` so the Edge driving VLM selects it. To specify a speed:
 
-**Query status and results**
+```bash
+python3 -m manager.run "x:-16 y:0 좌표까지 속도 0.2로 이동 후 보고해줘" --send
+```
+
+Without `--send`, the command saves an intent under `manager/outputs/` without sending it to Cloud. Currently, `manager` supports coordinate-based `move` requests with numeric x/y values.
+
+`manager` translates and validates natural-language intents; the Edge VLM selects paths and speeds from observations.
+
+The speed range is **0.01–0.35 m/s**; safety checks may slow or stop the robot.
+
+**Report preference (`report`)**
+
+| Natural-language request | Intent value | Edge behavior |
+|---|---|---|
+| “이동 후 보고해줘” (move and report) | `report:true` | Records the report request and includes the result in the `requested_report` field of `/health` |
+| “이동하고 보고는 하지 마” (move without reporting) | `report:false` | The `requested_report` field of `/health` is `null` |
+
+```bash
+python3 -m manager.run "x:-16 y:0 좌표까지 이동하고 보고는 하지 마" --send
+```
+
+Maintenance JSON logs, T5 terminal results, and manual report queries remain available with `false`. Manager currently relies on the model to interpret this preference; the default and model-failure fallback are `true`. Preview the generated value by omitting `--send`.
+
+**Query status and results** — replace `for_intent_id` with the actual intent ID printed by manager.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:5000/receive_intent \
@@ -104,16 +127,20 @@ curl -sS -X POST http://127.0.0.1:5000/receive_intent \
 - Final log: `logs/scenarios/YYYYMMDD_HHMMSS_ffffff_0001.json`
 - Terminal report: T5 prints the completion time, target and final positions, position error, and success status once when the scenario ends
 
-JSON logs are saved and terminal results are printed regardless of the `report` setting.
+Navigation results are stored in scenario logs; intent generation and delivery are recorded separately under `manager/outputs/`.
 
-Latest Isaac Sim navigation evidence: **`20261105_142601_978783_0001.json`**.
+Latest Isaac Sim navigation evidence: **`20261109_190648_553134_0001.json`** (`move_003`, `qwen3-vl:4b-instruct`).
 
 | Item | Verified Result |
 |---|---|
-| Actual MCP calls | `stop_robot → plan_path → execute_path`; all three calls succeeded, with matching correlation IDs and intent versions in server responses |
-| Target / final position | map `(-16.0, 0.0)` / `(-16.0271, -0.1263)` |
-| Position error / total duration | **12.92 cm / 4 min 2 sec** |
-| Execution | User-specified speed of `0.35 m/s`; four detour waypoints executed in a single navigation operation |
-| Successful completion | `success:true`, `stopped_verified:true`, `intent_closed:true`, 100% progress, and `remaining_path:[]` |
+| Actual MCP calls | Five successful `tools/call` requests covering observation, planning, and execution; matching server response IDs |
+| Target / final position | map `(-16.0, 0.0)` / `(-16.0237, -0.1344)` |
+| Position error / duration | **13.65 cm / 5 min 8 sec**, within the 15 cm tolerance |
+| Navigation and speed | VLM selected **0.2 m/s**, saved its explanation, and executed four detour waypoints |
+| Path/response validation | Planning and execution checks passed; one malformed model response was rejected and corrected |
+| Context handling | History compaction applied; maximum input **5,551 / 8,192 tokens**, no context overflow |
+| Successful completion | Measured arrival and stop verified, intent closed, **100%** progress, `remaining_path:[]` |
+
+The `speed_decision_result` event records `speed_mps` and `speed_reason`. Final success is independently verified from measured position and stopped motion.
 
 Cloud–Edge communication uses HTTP JSON. The standard A2A protocol has not yet been implemented.

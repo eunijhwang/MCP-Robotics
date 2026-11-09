@@ -2,7 +2,6 @@
 from .config import (
     ALLOWED_ACTIONS,
     DEFAULT_SAFETY_MARGIN_M,
-    DEFAULT_SPEED_MPS,
     FRAME_ID,
 )
 
@@ -29,10 +28,14 @@ def check_shape(obj) -> dict:
 def finalize(intent: dict, extracted: dict, seq: int):
     """
     Build the final intent. Returns (result, corrections).
-    x/y/speed/margin always come from the user text (or defaults), so a wrong
-    LLM number can never reach the robot; each override is reported.
+    Coordinates and explicit speed come from the user text. Only margin has
+    a default. Missing speed is omitted so the Edge VLM must select it.
     """
     corrections = []
+    # Always create the output constraints, even when the model's margin is
+    # already correct and the user supplied no speed. Never nest this in an if.
+    margin = extracted.get("safety_margin_m", DEFAULT_SAFETY_MARGIN_M)
+    constraints = {"safety_margin_m": margin}
 
     loc = intent["target_location"]
     for k in ("x", "y"):
@@ -43,12 +46,17 @@ def finalize(intent: dict, extracted: dict, seq: int):
         corrections.append(f"action: llm={intent.get('action')!r} -> 'move'")
 
     cons = intent.get("constraints") if isinstance(intent.get("constraints"), dict) else {}
-    margin = extracted.get("safety_margin_m", DEFAULT_SAFETY_MARGIN_M)
-    speed = extracted.get("speed_mps", DEFAULT_SPEED_MPS)
     if cons.get("safety_margin_m") != margin:
         corrections.append(f"safety_margin_m: llm={cons.get('safety_margin_m')} -> {margin}")
-    if cons.get("speed_mps") != speed:
-        corrections.append(f"speed_mps: llm={cons.get('speed_mps')} -> {speed}")
+    if "speed_mps" in extracted:
+        speed = extracted["speed_mps"]
+        constraints["speed_mps"] = speed
+        if cons.get("speed_mps") != speed:
+            corrections.append(f"speed_mps: llm={cons.get('speed_mps')} -> {speed}")
+    elif "speed_mps" in cons:
+        corrections.append(
+            f"speed_mps: llm={cons['speed_mps']} -> omitted (user did not specify; Edge VLM selects)"
+        )
 
     report = intent.get("report")
     if not isinstance(report, bool):
@@ -60,7 +68,7 @@ def finalize(intent: dict, extracted: dict, seq: int):
             "intent_id": f"move_{seq:03d}",
             "action": "move",
             "target_location": {"x": extracted["x"], "y": extracted["y"], "frame_id": FRAME_ID},
-            "constraints": {"safety_margin_m": margin, "speed_mps": speed},
+            "constraints": constraints,
             "report": report,
         }
     }

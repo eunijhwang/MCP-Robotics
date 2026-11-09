@@ -14,7 +14,7 @@ CLOUD_TIMEOUT = 5.0
 
 FRAME_ID = "map"
 DEFAULT_SAFETY_MARGIN_M = 0.45
-DEFAULT_SPEED_MPS = 0.2
+# No manager speed default: omission delegates selection to the Edge VLM.
 # Limits enforced by the Edge side (common/speed_policy.py, common/intent_contract.py)
 MIN_SPEED_MPS = 0.01
 MAX_SPEED_MPS = 0.35

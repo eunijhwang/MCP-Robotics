@@ -1,6 +1,6 @@
 {
   "intent": {
-    "intent_id": "move_006",
+    "intent_id": "move_001",
     "action": "move",
     "target_location": {
       "x": -16.0,

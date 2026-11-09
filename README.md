@@ -1,4 +1,4 @@
-# IETF-127 MCP-Robotics v2
+# IETF-127 MCP-Robotics
 
 Last updated: **2026-11-10**
 

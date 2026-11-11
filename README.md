@@ -68,16 +68,16 @@ Confirm `pose_valid:true`, `perception.ready:true`, `scan_error:null`, `map.map_
 Run **one** command for the intended speed mode:
 
 ```bash
-python3 -m manager.run "x:-16 y:0 좌표까지 이동 후 보고해줘" --send
-python3 -m manager.run "x:-16 y:0 좌표까지 속도 0.2로 이동 후 보고해줘" --send
+python3 -m manager.run "Go to x -16, y 0 and report back" --send
+python3 -m manager.run "Go to x -16, y 0 at 0.2 m/s and report back" --send
 ```
 
 Manager supports numeric x/y coordinate movement requests. Omit `--send` to preview and save the intent without execution. Speed is **0.01–0.35 m/s**; safety checks may slow or stop motion.
 
 | Report preference | Intent | Edge `/health` |
 |---|---|---|
-| “이동 후 보고해줘” | `report:true` | Includes `requested_report` |
-| “이동하고 보고는 하지 마” | `report:false` | `requested_report:null` |
+| “Go and report back” | `report:true` | Includes `requested_report` |
+| “Go, but do not report back” | `report:false` | `requested_report:null` |
 
 Logs, T5 terminal results and manual reports remain available with `false`. Report preference is model-interpreted; the default and model-failure fallback are `true`.
 
@@ -102,16 +102,16 @@ curl -sS -X POST http://127.0.0.1:5000/receive_intent \
 
 One JSON is saved per scenario at termination under `logs/scenarios/`; T5 prints the final result. The filename uses Edge process start time and a sequence number. `intent_id` and `intent_version` connect planning, stops, recovery and completion. Logs include model responses, MCP calls, path validation and speed explanations. Active logs are buffered in memory and can be lost on a hard process termination.
 
-Latest supplied Isaac Sim log: **`20261110_003158_184871_0001.json`** (`move_001`).
+Latest supplied Isaac Sim log: **`20261111_134306_252218_0001.json`** (`move_001`).
 
 | Item | Result |
 |---|---|
 | Outcome | Success; stop verified and Robot intent closed |
-| Target / final position | `(-16.0, 0.0)` / `(-16.0262, -0.1404)` in map |
-| Goal error / duration | **14.28 cm / 6 min 35 sec** |
-| Planning / speed | Four detour waypoints planned before execution; VLM selected **0.2 m/s** and recorded its explanation |
-| Model / MCP | **2 responses / 3 actual `tools/call` requests** (`stop_robot` → `plan_path` → `execute_path`) |
-| Completion | No recorded safety stops or model-response rejections; **100%**, no remaining path |
+| Target / final position | `(-16.0, 0.0) / (-16.0366, -0.1277)` in map |
+| Goal error / duration | **13.9 cm / 10 min 23 sec** |
+| Planning / speed | Collision detected → 4-waypoint detour; VLM selected **0.2 m/s** with explanation
+| Model / MCP | **10 model responses / 9 actual tools/call requests** (`stop_robot` ×2, `plan_path` ×2, `execute_path` ×4, `reset_safety_stop` ×1); 2 motion operations accepted |
+| Completion | **100%**, no remaining path |
 
 This records one run, not a performance benchmark.
 
